@@ -1,0 +1,285 @@
+{
+  "name": "WhatsApp inventory triage (Claude + guardrails)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "inventory-message",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "2b0516c2-0966-4288-863c-4b2e2372e605",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "webhookId": "9ac9c76e-8030-47f2-819d-2a9f5f5496df"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Validate input and reject duplicates (idempotency by message_id).\nconst body = $input.first().json.body ?? {};\nconst messageId = String(body.message_id ?? '').trim();\nconst text = String(body.text ?? '').trim();\n\nif (!messageId || !text) {\n  return [{ json: { skip: true, status: 'rejected', reason: 'message_id and text are required' } }];\n}\nif (text.length > 1000) {\n  return [{ json: { skip: true, status: 'rejected', reason: 'message too long (max 1000 chars)', message_id: messageId } }];\n}\n\nconst store = $getWorkflowStaticData('global');\nstore.processed = store.processed || {};\nif (store.processed[messageId]) {\n  return [{ json: { skip: true, status: 'duplicate', message_id: messageId, original_result: store.processed[messageId] } }];\n}\n\nreturn [{ json: { skip: false, message_id: messageId, from: body.from ?? null, text } }];\n"
+      },
+      "id": "80cc684e-8e64-4b7d-87a8-8d65c5c2e390",
+      "name": "Validate & dedupe",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "90ac3004-7959-44b5-a1e1-82c272f73fc1",
+              "leftValue": "={{ $json.skip }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "6b4fb493-efd4-4fa1-a57b-7443e5e1883c",
+      "name": "Skip?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        440,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "firstIncomingItem",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "e39957d9-9efd-418c-9ed5-a0f7c73580d4",
+      "name": "Respond: skipped",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        660,
+        140
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: 'claude-haiku-4-5-20251001', max_tokens: 300, temperature: 0, system: \"You classify WhatsApp messages from construction and workshop crews about inventory.\\nCatalog SKUs: EPP-CASCO (safety helmet), EPP-GUANTE (work gloves), EPP-LENTE (safety glasses), FLT-ACEITE (oil filter), MAT-CEMENTO (cement bag 25kg).\\nReturn ONLY a JSON object with these keys:\\nintent: \\\"stock_movement\\\" | \\\"stock_query\\\" | \\\"other\\\"\\nsku: one catalog SKU, or null\\ntype: \\\"in\\\" | \\\"out\\\" | null (only for stock_movement)\\nquantity: integer or null (only for stock_movement)\\nconfidence: number from 0 to 1\\nneeds_human: boolean\\nreason: short string\\nRules: never invent a quantity that is not written in the message; if the product is not in the catalog, or the message is ambiguous, a complaint, or asks for a person, set needs_human to true.\", messages: [{ role: 'user', content: $json.text }] }) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "40038761-ec17-4f91-a83f-d884cfa4b010",
+      "name": "Claude: classify",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        660,
+        400
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse Claude's output and apply guardrails before anything is trusted.\nconst original = $('Validate & dedupe').first().json;\nconst raw = $input.first().json;\nconst fullText = (raw.content ?? []).filter((b) => b.type === 'text').map((b) => b.text).join('');\n// Take only the JSON object, even if the model wraps it in text or code fences.\nconst start = fullText.indexOf('{');\nconst end = fullText.lastIndexOf('}');\nconst modelText = start >= 0 && end > start ? fullText.slice(start, end + 1) : '';\n\nconst escalate = (reason, extra = {}) => ({\n  status: 'escalated',\n  needs_human: true,\n  reason,\n  message_id: original.message_id,\n  text: original.text,\n  ...extra,\n});\n\nlet result;\nlet data;\ntry {\n  data = JSON.parse(modelText);\n} catch (e) {\n  result = escalate('model output is not valid JSON');\n}\n\nif (!result) {\n  const INTENTS = ['stock_movement', 'stock_query', 'other'];\n  const SKUS = ['EPP-CASCO', 'EPP-GUANTE', 'EPP-LENTE', 'FLT-ACEITE', 'MAT-CEMENTO'];\n  const confidence = Number(data.confidence);\n\n  if (!INTENTS.includes(data.intent)) {\n    result = escalate(`unknown intent: ${data.intent}`);\n  } else if (!(confidence >= 0 && confidence <= 1)) {\n    result = escalate('missing or invalid confidence');\n  } else if (data.intent === 'other' || data.needs_human === true) {\n    result = escalate(data.reason || 'model requested a human', { intent: data.intent });\n  } else if (confidence < 0.7) {\n    result = escalate(`low confidence (${confidence})`, { intent: data.intent });\n  } else if (!SKUS.includes(data.sku)) {\n    result = escalate(`SKU not in catalog: ${data.sku}`, { intent: data.intent });\n  } else if (data.intent === 'stock_movement') {\n    const qty = data.quantity;\n    if (!Number.isInteger(qty) || qty <= 0) {\n      result = escalate('quantity must be a positive whole number', { intent: data.intent });\n    } else if (!['in', 'out'].includes(data.type)) {\n      result = escalate('movement type must be in or out', { intent: data.intent });\n    } else if (!new RegExp(`\\\\b${qty}\\\\b`).test(original.text)) {\n      // The model may not invent numbers: the quantity must literally appear in the user's message.\n      result = escalate(`quantity ${qty} does not appear in the message`, { intent: data.intent });\n    }\n  }\n\n  if (!result) {\n    result = {\n      status: 'ok',\n      needs_human: false,\n      message_id: original.message_id,\n      action: {\n        intent: data.intent,\n        sku: data.sku,\n        ...(data.intent === 'stock_movement' ? { type: data.type, quantity: data.quantity } : {}),\n        confidence,\n      },\n    };\n  }\n}\n\n// Remember the outcome only after processing, so a failed run can be retried safely.\nconst store = $getWorkflowStaticData('global');\nstore.processed = store.processed || {};\nstore.processed[original.message_id] = { status: result.status, at: new Date().toISOString() };\nconst keys = Object.keys(store.processed);\nif (keys.length > 500) for (const k of keys.slice(0, keys.length - 500)) delete store.processed[k];\n\nreturn [{ json: result }];\n"
+      },
+      "id": "415350f0-cf0d-41a6-9509-94593911ac4f",
+      "name": "Guardrails",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "e301fb53-6803-4080-99c1-c164c6a3ff0e",
+              "leftValue": "={{ $json.needs_human }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "5a944563-c2b4-4b52-9bb7-85539a848502",
+      "name": "Needs human?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "firstIncomingItem",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "fc6a2b19-2e49-4b37-9676-9aeb7fc14159",
+      "name": "Respond: escalated",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1320,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "firstIncomingItem",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "a1cd7a83-a58b-4c7e-a9f4-548f456208cb",
+      "name": "Respond: ok",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1320,
+        500
+      ]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Validate & dedupe",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate & dedupe": {
+      "main": [
+        [
+          {
+            "node": "Skip?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Skip?": {
+      "main": [
+        [
+          {
+            "node": "Respond: skipped",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Claude: classify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude: classify": {
+      "main": [
+        [
+          {
+            "node": "Guardrails",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Guardrails": {
+      "main": [
+        [
+          {
+            "node": "Needs human?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs human?": {
+      "main": [
+        [
+          {
+            "node": "Respond: escalated",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond: ok",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false
+  }
+}
